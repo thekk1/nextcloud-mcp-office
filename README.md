@@ -1,0 +1,14 @@
+# nextcloud-mcp-office
+
+[nextcloud-mcp-server](https://github.com/cbcoutinho/nextcloud-mcp-server) 0.202.1 with additional tools:
+
+- `bos_office.py`: Office tools (create, edit and convert documents, spreadsheets, presentations and PDF in
+  Nextcloud), copying chat files into Nextcloud (`nc_office_save_chat_file`), and `nc_files_check_list`.
+- `bos_start.py`: starts the server with the Office tools as an additional app `office`, a document processor
+  for `.docx`, and an additional ownership check for Login Flow v2 grants.
+
+The image is derived from the upstream image (pinned by digest, see `Dockerfile`).
+
+```bash
+docker build -t nextcloud-mcp-office .
+```
