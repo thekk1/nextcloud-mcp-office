@@ -1230,8 +1230,10 @@ def chat_files(user_id: str) -> list[dict[str, Any]]:
 
 # --- Werkzeuge --------------------------------------------------------------------------------------------------
 
-# Sortierschluessel von nc_webdav_find_by_type und die WebDAV-Eigenschaft, nach der Nextcloud sortiert
-_ORDER_PROPS = {"size": "getcontentlength", "modified": "getlastmodified", "name": "displayname"}
+# Sortierschluessel von nc_webdav_find_by_type und die WebDAV-Eigenschaft, nach der Nextcloud sortiert.
+# Groesse ueber oc:size: d:getcontentlength ist in der Suche nur abrufbar, nicht sortierbar (HTTP 400
+# "requested order by property is not a valid property for this scope").
+_ORDER_PROPS = {"size": "{http://owncloud.org/ns}size", "modified": "getlastmodified", "name": "displayname"}
 
 
 def configure_office_tools(mcp: MCPServer) -> None:

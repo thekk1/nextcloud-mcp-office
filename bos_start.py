@@ -15,12 +15,14 @@ mit dem der Zugriff gewaehrt wurde, ist der preferred_username des Aufrufers aus
 App-Passwort meldet sich an Nextcloud an.
 """
 import logging
+import re
 import sys
 
 import httpx
 
 from nextcloud_mcp_server import app, server
 from nextcloud_mcp_server.auth import grant_ownership, provision_routes
+from nextcloud_mcp_server.client.webdav import WebDAVClient
 from nextcloud_mcp_server.config import get_document_processor_config, get_settings
 from nextcloud_mcp_server.server import auth_tools
 
@@ -47,6 +49,19 @@ def initialize_document_processors():
 
 
 app.initialize_document_processors = initialize_document_processors
+
+# WebDAV-Suche: upstream schreibt die Sortiereigenschaft als <d:order><oc:size/><d:descending/></d:order>.
+# RFC 5323 und searchdav (Order::xmlDeserialize liest {DAV:}prop) verlangen <d:order><d:prop>...</d:prop>, sonst
+# antwortet Nextcloud mit 400 "requested order by property is not a valid property for this scope".
+_ORDER_WITHOUT_PROP = re.compile(r"<d:order>(<[a-z]+:[A-Za-z_-]+/>)(<d:(?:ascending|descending)/>)</d:order>")
+_build_search_xml = WebDAVClient._build_search_xml
+
+
+def _build_search_xml_with_order_prop(self, *args, **kwargs):
+    return _ORDER_WITHOUT_PROP.sub(r"<d:order><d:prop>\1</d:prop>\2</d:order>", _build_search_xml(self, *args, **kwargs))
+
+
+WebDAVClient._build_search_xml = _build_search_xml_with_order_prop
 
 _caller_identities = grant_ownership.caller_identities
 _grant_belongs_to_caller = grant_ownership.grant_belongs_to_caller
