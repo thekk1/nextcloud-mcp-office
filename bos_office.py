@@ -24,7 +24,7 @@ import pathlib
 import re
 import secrets
 import zipfile
-from typing import Any
+from typing import Any, Literal
 
 import anyio
 import httpx
@@ -35,6 +35,8 @@ from mcp.types import ToolAnnotations
 from nextcloud_mcp_server.auth import require_scopes
 from nextcloud_mcp_server.config import get_settings
 from nextcloud_mcp_server.context import get_client
+from nextcloud_mcp_server.links import with_links
+from nextcloud_mcp_server.models.webdav import FileInfo, SearchFilesResponse
 from nextcloud_mcp_server.observability.metrics import instrument_tool
 from nextcloud_mcp_server.server.tag_exclusion import get_excluded_file_paths, is_path_excluded
 
@@ -1228,7 +1230,55 @@ def chat_files(user_id: str) -> list[dict[str, Any]]:
 
 # --- Werkzeuge --------------------------------------------------------------------------------------------------
 
+# Sortierschluessel von nc_webdav_find_by_type und die WebDAV-Eigenschaft, nach der Nextcloud sortiert
+_ORDER_PROPS = {"size": "getcontentlength", "modified": "getlastmodified", "name": "displayname"}
+
+
 def configure_office_tools(mcp: MCPServer) -> None:
+    # Ersetzt das gleichnamige Werkzeug aus nextcloud_mcp_server.server.webdav (die App "office" wird zuletzt
+    # eingerichtet). Ohne Sortierung war "die groessten/neuesten N Dateien eines Typs" nur ueber alle Treffer
+    # zu beantworten, die das Modell Ordner fuer Ordner einsammelte, bis das Rekursionslimit griff.
+    mcp.remove_tool("nc_webdav_find_by_type")
+
+    @mcp.tool(title="Find Files by Type", annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+    @require_scopes("files.read")
+    @with_links
+    @instrument_tool
+    async def nc_webdav_find_by_type(mime_type: str, ctx: Context, scope: str = "", limit: int | None = None,
+                                     order_by: Literal["size", "modified", "name"] | None = None,
+                                     descending: bool = True) -> SearchFilesResponse:
+        """Find files by MIME type in NextCloud, searching all subfolders of scope.
+
+        Args:
+            mime_type: MIME type to search for (supports % wildcard)
+            scope: Directory path to search in (empty string for user root)
+            limit: Maximum number of results to return
+            order_by: Sort on the server before limit applies: "size", "modified" or "name".
+                For "the N largest / newest files of a type" call once with order_by and limit=N;
+                do not collect files folder by folder.
+            descending: Direction for order_by; true (default) puts the largest / newest first
+
+        Returns:
+            SearchFilesResponse with list of matching files
+        """
+        client = await get_client(ctx)
+        excluded = await get_excluded_file_paths(client.webdav)
+        if scope and is_path_excluded(scope, excluded):
+            raise ToolError(f"Access denied: scope {scope!r} is tagged with an excluded tag")
+        where_conditions, properties = client.webdav._type_search_args(mime_type)
+        results = await client.webdav.search_files(
+            scope=scope, where_conditions=where_conditions, properties=properties,
+            order_by=[(_ORDER_PROPS[order_by], "descending" if descending else "ascending")] if order_by else None,
+            limit=limit)
+        if excluded:
+            results = [r for r in results if not is_path_excluded(r.get("path", ""), excluded)]
+        filters: dict[str, Any] = {"mime_type": mime_type}
+        if order_by:
+            filters["order_by"] = f"{order_by} {'descending' if descending else 'ascending'}"
+        file_infos = [FileInfo(**r) for r in results]
+        return SearchFilesResponse(results=file_infos, total_found=len(file_infos), scope=scope,
+                                   filters_applied=filters)
+
     @mcp.tool(title="Create Office Document", annotations=ToolAnnotations(idempotent_hint=False, open_world_hint=True))
     @require_scopes("files.write")
     @instrument_tool
