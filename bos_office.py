@@ -1658,9 +1658,9 @@ def configure_office_tools(mcp: MCPServer) -> None:
         +word requires a word, -word excludes it, "two words" is a phrase, rech* a prefix. Use +word when all
         words must occur. ``extension``: only files with this extension, e.g. "pdf". ``match``: "content" or
         "filename" limit where to look. ``limit``: results per page, at most 50. ``page``: next results.
-        Returns ``total`` (all hits), ``has_more`` and for each result its path, usable with nc_webdav_read_file,
-        with mime type, size, modified time and short text excerpts around the hits. Excerpts are not the whole
-        document: read the file before relying on its content.
+        Returns ``total`` (all hits, counted up to 10000), ``has_more`` and for each result its path, usable with
+        nc_webdav_read_file, with mime type, size, modified time and short text excerpts around the hits. Excerpts
+        are not the whole document: read the file before relying on its content.
         """
         if not query.strip():
             raise ToolError("query is empty")
