@@ -15,6 +15,7 @@ Anhaenge und Ergebnisse der Codeausfuehrung aus dem Chat kopiert nc_office_save_
 Nextcloud (siehe "Dateien aus dem Chat").
 """
 import copy
+import datetime
 import io
 import json
 import logging
@@ -80,6 +81,9 @@ def kind(path: str) -> str:
 
 CHECK_LIST_MAX_TERMS = 1000
 CHECK_LIST_MAX_HITS = 20
+FULLTEXT_MAX_LIMIT = 50
+FULLTEXT_EXCERPTS = 3
+FULLTEXT_EXCERPT_CHARS = 300
 
 
 def parse_terms(raw: Any) -> list[str]:
@@ -1638,3 +1642,68 @@ def configure_office_tools(mcp: MCPServer) -> None:
         if not only_missing:
             result["found"] = found
         return result
+
+    @mcp.tool(title="Full Text Search", annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+    @require_scopes("files.read")
+    @instrument_tool
+    async def nc_fulltext_search(query: str, ctx: Context, extension: str = "",
+                                 match: Literal["all", "content", "filename"] = "all",
+                                 limit: int = 20, page: int = 1):
+        """Search the content of files with the full text index of Nextcloud, including OCR text of PDFs.
+
+        Use this to find documents by what they say; nc_webdav_find_by_name only sees names. Finds only files the
+        user may access, and files that are indexed: files with a password are not.
+
+        ``query``: words, not case-sensitive. Several words find files with ANY of them, ranked by relevance;
+        +word requires a word, -word excludes it, "two words" is a phrase, rech* a prefix. Use +word when all
+        words must occur. ``extension``: only files with this extension, e.g. "pdf". ``match``: "content" or
+        "filename" limit where to look. ``limit``: results per page, at most 50. ``page``: next results.
+        Returns ``total`` (all hits), ``has_more`` and for each result its path, usable with nc_webdav_read_file,
+        with mime type, size, modified time and short text excerpts around the hits. Excerpts are not the whole
+        document: read the file before relying on its content.
+        """
+        if not query.strip():
+            raise ToolError("query is empty")
+        extension = extension.strip().lstrip(".")
+        if extension and not re.fullmatch(r"[A-Za-z0-9]+", extension):
+            raise ToolError("extension may only contain letters and digits")
+        if not 1 <= limit <= FULLTEXT_MAX_LIMIT:
+            raise ToolError(f"limit must be between 1 and {FULLTEXT_MAX_LIMIT}")
+        if page < 1:
+            raise ToolError("page must be at least 1")
+        options: dict[str, Any] = {}
+        if extension:
+            # Die App setzt den Wert in einen regulaeren Ausdruck ein, der Gross- und Kleinschreibung unterscheidet
+            options["files_extension"] = "".join(f"[{c.lower()}{c.upper()}]" if c.isalpha() else c for c in extension)
+        if match != "all":
+            options["in"] = [match]
+        request = {"providers": "files", "search": query, "page": page, "size": limit, "options": options,
+                   "tags": [], "subtags": [], "parts": []}
+        client = await get_client(ctx)
+        try:
+            response = await client.webdav._make_request("GET", "/apps/fulltextsearch/v1/remote",
+                                                         params={"request": json.dumps(request)},
+                                                         headers={"Accept": "application/json"})
+        except httpx.HTTPStatusError as e:
+            raise ToolError(f"Full text search failed (HTTP {e.response.status_code})") from e
+        data = response.json()
+        if data.get("status") != 1 or not data.get("result"):
+            raise ToolError(f"Full text search failed: {data.get('message') or data.get('status')}")
+        found = data["result"][0]
+        total = found["meta"]["total"]
+        excluded = await get_excluded_file_paths(client.webdav)
+        results = []
+        for document in found["documents"]:
+            info = document.get("info") or {}
+            path = (info.get("path") or "").strip("/")
+            if not path or is_path_excluded(path, excluded):
+                continue
+            mtime = info.get("mtime")
+            excerpts = [e["excerpt"].strip()[:FULLTEXT_EXCERPT_CHARS] for e in document.get("excerpts") or []
+                        if e.get("excerpt")]
+            results.append({"path": path, "type": info.get("type"), "mime_type": info.get("mime"),
+                            "size": info.get("size"),
+                            "modified": datetime.datetime.fromtimestamp(mtime, datetime.UTC).isoformat() if mtime else None,
+                            "excerpts": excerpts[:FULLTEXT_EXCERPTS]})
+        return {"query": query, "total": total, "page": page, "limit": limit, "has_more": page * limit < total,
+                "results": results}
