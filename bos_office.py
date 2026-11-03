@@ -1177,7 +1177,8 @@ def inspect_native(data: bytes, k: str) -> dict[str, Any]:
 # LibreChat legt Anhaenge und Ergebnisse der Codeausfuehrung als uploads/<Benutzer-ID>/<file_id>__<Name> ab; das
 # Verzeichnis ist hier nur lesbar eingehaengt (CHAT_FILES_DIR). Bilder aus der Codeausfuehrung wandelt LibreChat um
 # und legt sie ohne Originalnamen als images/<Benutzer-ID>/<file_id>.<Format> ab (CHAT_IMAGES_DIR, ebenfalls nur
-# lesbar); Bilder aus anderen Werkzeugen tragen dort einen laengeren Namen und bleiben aussen vor. Die Benutzer-ID
+# lesbar). Bilder aus Werkzeugergebnissen liegen dort als <file_id>__<Name> (BOS-Patch tool-files von LibreChat);
+# die Bilder, die LibreChat selbst aus Werkzeugergebnissen ablegt (<uuid>-<Werkzeug>_img_...), bleiben aussen vor. Die Benutzer-ID
 # kommt als Header von LibreChat. Nur mit dem gemeinsamen Secret gilt sie: andere Container im Docker-Netz koennten
 # sonst fremde IDs angeben.
 
@@ -1223,8 +1224,15 @@ def chat_files(user_id: str) -> list[dict[str, Any]]:
     images = pathlib.Path(CHAT_IMAGES_DIR) / user_id if CHAT_IMAGES_DIR else None
     if images and images.is_dir():
         for p in images.iterdir():
-            if CODE_IMAGE.fullmatch(p.name) and p.is_file() and not p.is_symlink():
+            if not p.is_file() or p.is_symlink():
+                continue
+            if CODE_IMAGE.fullmatch(p.name):
                 found.append(entry(p, f"image-{p.stem[:8]}{p.suffix}", p.stem, code_image=True))
+                continue
+            # Bilder aus Werkzeugergebnissen speichert LibreChat (BOS-Patch tool-files) mit Namen
+            file_id, sep, name = p.name.partition("__")
+            if sep and name:
+                found.append(entry(p, name, file_id))
     return sorted(found, key=lambda f: f["mtime"], reverse=True)
 
 
