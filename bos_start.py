@@ -18,6 +18,8 @@ import functools
 import logging
 import re
 import sys
+import xml.etree.ElementTree as ET
+from urllib.parse import unquote
 
 import httpx
 
@@ -63,10 +65,106 @@ _build_search_xml = WebDAVClient._build_search_xml
 
 
 def _build_search_xml_with_order_prop(self, *args, **kwargs):
+    if "size" not in kwargs.get("properties", ["size"]):
+        kwargs["properties"] = [*kwargs["properties"], "size"]
     return _ORDER_WITHOUT_PROP.sub(r"<d:order><d:prop>\1</d:prop>\2</d:order>", _build_search_xml(self, *args, **kwargs))
 
 
 WebDAVClient._build_search_xml = _build_search_xml_with_order_prop
+
+# Ordnergroessen: upstream liefert bei Ordnern size=None, die Groesse eines Ordners liesse sich nur durch Aufsummieren
+# aller Dateien ermitteln. Nextcloud kennt sie: oc:size ist die rekursive Groesse aus dem Datei-Cache, negative Werte
+# heissen "noch nicht berechnet" (FileInfo::SPACE_*). list_directory hat die Abfrage fest im Code, deshalb holt ein
+# zweiter PROPFIND die Groessen. Scheitert er, bleibt die Auflistung ohne sie gueltig.
+# total_size zaehlt Unterordner mit: Das ist zugleich die Groesse des aufgelisteten Ordners, auch fuer die Wurzel.
+# Upstream-Fassung: Branch pr/folder-sizes in thekk1/nextcloud-mcp-server
+_SIZE_PROPFIND = ('<?xml version="1.0"?><d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">'
+                  "<d:prop><oc:size/></d:prop></d:propfind>")
+_list_directory = WebDAVClient.list_directory
+_parse_search_response = WebDAVClient._parse_search_response
+
+
+def _folder_size(value) -> int | None:
+    try:
+        size = int(value or "")
+    except ValueError:
+        return None
+    return size if size >= 0 else None
+
+
+async def _folder_sizes(client: WebDAVClient, path: str) -> dict[str, int | None]:
+    response = await client._make_request(
+        "PROPFIND", client._webdav_path(path).rstrip("/") + "/", content=_SIZE_PROPFIND,
+        headers={"Depth": "1", "Content-Type": "text/xml"},
+    )
+    response.raise_for_status()
+    return {
+        unquote((entry.findtext("{DAV:}href") or "").rstrip("/").split("/")[-1]):
+            _folder_size(entry.findtext(".//{http://owncloud.org/ns}size"))
+        for entry in ET.fromstring(response.content).findall("{DAV:}response")[1:]
+    }
+
+
+async def _list_directory_with_folder_sizes(self, path: str = ""):
+    items = await _list_directory(self, path)
+    if any(item["is_directory"] for item in items):
+        try:
+            sizes = await _folder_sizes(self, path)
+        except Exception as e:
+            logger.warning("Could not read the folder sizes of %r: %s", path, e)
+            return items
+        for item in items:
+            if item["is_directory"]:
+                item["size"] = sizes.get(item["name"])
+    return items
+
+
+def _parse_search_response_with_folder_sizes(self, *args, **kwargs):
+    items = _parse_search_response(self, *args, **kwargs)
+    for item in items:
+        if item.get("is_directory"):
+            item["size"] = _folder_size(item.get("total_size"))
+    return items
+
+
+WebDAVClient.list_directory = _list_directory_with_folder_sizes
+WebDAVClient._parse_search_response = _parse_search_response_with_folder_sizes
+
+
+def _total_size_includes_folders(tool):
+    @functools.wraps(tool)
+    async def wrapper(*args, **kwargs):
+        result = await tool(*args, **kwargs)
+        result.total_size = sum(entry.size or 0 for entry in result.files)
+        return result
+    wrapper.__doc__ = tool.__doc__.replace(
+        "and total_size\n", "and total_size.\n            A folder's size covers everything inside it, and so does total_size.\n"
+    )
+    return wrapper
+
+
+class _WrappedTools:
+    """Steht bei der Registrierung fuer den MCP-Server und legt Ergaenzungen um die fertig dekorierten Werkzeuge."""
+
+    def __init__(self, mcp, wrappers):
+        self._mcp = mcp
+        self._wrappers = wrappers
+
+    def __getattr__(self, name):
+        return getattr(self._mcp, name)
+
+    def tool(self, *args, **kwargs):
+        register = self._mcp.tool(*args, **kwargs)
+
+        def decorator(tool):
+            wrap = self._wrappers.get(tool.__name__)
+            return register(wrap(tool) if wrap else tool)
+        return decorator
+
+
+_configure_webdav_tools = server.AVAILABLE_APPS["webdav"]
+server.AVAILABLE_APPS["webdav"] = lambda mcp: _configure_webdav_tools(
+    _WrappedTools(mcp, {"nc_webdav_list_directory": _total_size_includes_folders}))
 
 _caller_identities = grant_ownership.caller_identities
 _grant_belongs_to_caller = grant_ownership.grant_belongs_to_caller
@@ -186,27 +284,12 @@ def _provision_replaces_rejected(tool):
     return wrapper
 
 
-_AUTH_TOOL_CHECKS = {"nc_auth_check_status": _status_reports_revoked,
-                     "nc_auth_provision_access": _provision_replaces_rejected}
-
-
-class _CheckedAuthTools:
-    """Steht bei register_auth_tools fuer den MCP-Server und legt die Pruefung um die fertig dekorierten Werkzeuge."""
-
-    def __init__(self, mcp):
-        self._mcp = mcp
-
-    def tool(self, *args, **kwargs):
-        register = self._mcp.tool(*args, **kwargs)
-        check = _AUTH_TOOL_CHECKS.get(kwargs.get("name"))
-        return (lambda tool: register(check(tool))) if check else register
-
-
 _register_auth_tools = auth_tools.register_auth_tools
 
 
 def register_auth_tools(mcp):
-    _register_auth_tools(_CheckedAuthTools(mcp))
+    _register_auth_tools(_WrappedTools(mcp, {"nc_auth_check_status": _status_reports_revoked,
+                                             "nc_auth_provision_access": _provision_replaces_rejected}))
 
 
 app.register_auth_tools = register_auth_tools
