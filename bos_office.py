@@ -12,8 +12,9 @@ ueber den Custom Processor (dokumente) Markdown liefert. Zellen einer xlsx setzt
 ohne die uebrigen Teile anzufassen.
 
 Anhaenge und Ergebnisse der Codeausfuehrung aus dem Chat kopiert nc_office_save_chat_file im Original in die
-Nextcloud (siehe "Dateien aus dem Chat").
+Nextcloud (siehe "Dateien aus dem Chat"); den umgekehrten Weg geht nc_office_copy_file_to_chat.
 """
+import base64
 import copy
 import datetime
 import io
@@ -82,6 +83,8 @@ def kind(path: str) -> str:
 CHECK_LIST_MAX_TERMS = 1000
 CHECK_LIST_MAX_HITS = 20
 FULLTEXT_MAX_LIMIT = 50
+# LibreChat (tool-files) stores files from tool results up to this size
+CHAT_FILE_MAX_BYTES = 50 * 1024 * 1024
 FULLTEXT_EXCERPTS = 3
 FULLTEXT_EXCERPT_CHARS = 300
 
@@ -1592,6 +1595,30 @@ def configure_office_tools(mcp: MCPServer) -> None:
         result["source"] = {"name": source["name"], "file_id": source["file_id"], "modified": source["modified"],
                             **({"code_image": True} if source.get("code_image") else {})}
         return result
+
+    @mcp.tool(title="Copy Nextcloud File to Chat",
+              annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+    @require_scopes("files.read")
+    @instrument_tool
+    async def nc_office_copy_file_to_chat(path: str, ctx: Context):
+        """Copy a Nextcloud file unchanged into the chat, of any type: also plain text, scripts, JSON and CSV.
+        The result is a [FILE] line: code execution gets the file under /mnt/data, other tools get it through
+        {{file:...}}, and nc_office_save_chat_file copies it back.
+
+        Use this whenever code has to process, compare, hash or change a file. Never paste the content of a
+        file read with nc_webdav_read_file into code: retyped content is slow and can differ from the original.
+        To read a file yourself, use nc_webdav_read_file. At most 50 MiB.
+        """
+        client = await get_client(ctx)
+        data, etag = await load(client, path)
+        if len(data) > CHAT_FILE_MAX_BYTES:
+            raise ToolError(f"{path!r} has {len(data) / 1048576:.1f} MB; at most 50 MiB can be copied into the chat")
+        name = pathlib.PurePosixPath(path).name
+        content_type = MIME.get(ext(path)) or mimetypes.guess_type(name)[0] or "application/octet-stream"
+        return {"path": path, "filename": name, "content_type": content_type, "size": len(data), "etag": etag,
+                "content_base64": base64.b64encode(data).decode("ascii"),
+                # LibreChat (tool-files) then returns only the [FILE] line, also for text
+                "as_file": True}
 
 
     @mcp.tool(title="Check List Against Files", annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
