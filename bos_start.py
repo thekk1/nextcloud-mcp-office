@@ -22,6 +22,8 @@ import httpx
 
 from nextcloud_mcp_server import app, server
 from nextcloud_mcp_server.auth import grant_ownership, provision_routes
+from nextcloud_mcp_server.auth.scope_authorization import invalidate_scope_cache
+from nextcloud_mcp_server.auth.storage import OCS_REQUEST_HEADERS, nextcloud_httpx_client
 from nextcloud_mcp_server.client.webdav import WebDAVClient
 from nextcloud_mcp_server.config import get_document_processor_config, get_settings
 from nextcloud_mcp_server.server import auth_tools
@@ -99,6 +101,48 @@ async def grant_belongs_to_caller(identities: set[str], login_name: str | None, 
 for module in (grant_ownership, provision_routes, auth_tools):
     module.caller_identities = caller_identities
     module.grant_belongs_to_caller = grant_belongs_to_caller
+
+# In Nextcloud zurueckgezogenes App-Passwort: upstream prueft in den nc_auth-Werkzeugen nur, ob eines gespeichert
+# ist. Der Status bleibt dann "provisioned", alle Werkzeuge enden mit 401, und nc_auth_provision_access liefert keinen
+# Anmeldelink. Hier prueft Nextcloud das Passwort, bei 401/403 gilt es als nicht vorhanden und wird geloescht. 429 und
+# Netzfehler sagen nichts ueber das Passwort. Upstream-Fassung: Branch pr/verify-stored-app-password in thekk1/nextcloud-mcp-server
+_get_shared_storage = auth_tools.get_shared_storage
+
+
+class _CheckedStorage:
+    def __init__(self, storage):
+        self._storage = storage
+
+    def __getattr__(self, name):
+        return getattr(self._storage, name)
+
+    async def get_app_password_with_scopes(self, user_id: str):
+        existing = await self._storage.get_app_password_with_scopes(user_id)
+        if not existing:
+            return existing
+        try:
+            async with nextcloud_httpx_client(
+                base_url=get_settings().nextcloud_host,
+                auth=httpx.BasicAuth(existing.get("username") or user_id, existing["app_password"]),
+                timeout=10.0,
+            ) as client:
+                status = (await client.get("/ocs/v2.php/cloud/user", headers=dict(OCS_REQUEST_HEADERS))).status_code
+        except Exception as e:
+            logger.warning("Could not validate the app password of %s: %s", user_id, e)
+            return existing
+        if status not in (401, 403):
+            return existing
+        logger.info("App password of %s rejected by Nextcloud (HTTP %s), removing", user_id, status)
+        await self._storage.delete_app_password(user_id)
+        invalidate_scope_cache(user_id)
+        return None
+
+
+async def _get_checked_storage():
+    return _CheckedStorage(await _get_shared_storage())
+
+
+auth_tools.get_shared_storage = _get_checked_storage
 
 from nextcloud_mcp_server.cli import cli  # noqa: E402  (nach dem Eintrag, die CLI liest AVAILABLE_APPS beim Import)
 
