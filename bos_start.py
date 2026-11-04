@@ -14,6 +14,7 @@ und Nextcloud prueft keine Keycloak-Tokens (user_oidc ohne Provider). Zusaetzlic
 mit dem der Zugriff gewaehrt wurde, ist der preferred_username des Aufrufers aus dem Keycloak-Userinfo, und das
 App-Passwort meldet sich an Nextcloud an.
 """
+import functools
 import logging
 import re
 import sys
@@ -24,8 +25,10 @@ from nextcloud_mcp_server import app, server
 from nextcloud_mcp_server.auth import grant_ownership, provision_routes
 from nextcloud_mcp_server.auth.scope_authorization import invalidate_scope_cache
 from nextcloud_mcp_server.auth.storage import OCS_REQUEST_HEADERS, nextcloud_httpx_client
+from nextcloud_mcp_server.client.ocs import OCS_STATUS_UNAUTHENTICATED, parse_ocs_envelope
 from nextcloud_mcp_server.client.webdav import WebDAVClient
 from nextcloud_mcp_server.config import get_document_processor_config, get_settings
+from nextcloud_mcp_server.models.auth import ProvisionStatusResponse
 from nextcloud_mcp_server.server import auth_tools
 
 import bos_office
@@ -102,47 +105,111 @@ for module in (grant_ownership, provision_routes, auth_tools):
     module.caller_identities = caller_identities
     module.grant_belongs_to_caller = grant_belongs_to_caller
 
-# In Nextcloud zurueckgezogenes App-Passwort: upstream prueft in den nc_auth-Werkzeugen nur, ob eines gespeichert
-# ist. Der Status bleibt dann "provisioned", alle Werkzeuge enden mit 401, und nc_auth_provision_access liefert keinen
-# Anmeldelink. Hier prueft Nextcloud das Passwort, bei 401/403 gilt es als nicht vorhanden und wird geloescht. 429 und
-# Netzfehler sagen nichts ueber das Passwort. Upstream-Fassung: Branch pr/verify-stored-app-password in thekk1/nextcloud-mcp-server
-_get_shared_storage = auth_tools.get_shared_storage
+# In Nextcloud zurueckgezogenes App-Passwort: upstream prueft in den nc_auth-Werkzeugen nur, ob eines gespeichert ist.
+# Der Status bleibt dann "provisioned", alle Werkzeuge enden mit 401, und nc_auth_provision_access liefert keinen
+# Anmeldelink. Hier fragt der Status bei Nextcloud nach und meldet "revoked", loescht aber nichts (nur lesendes
+# Werkzeug). nc_auth_provision_access loescht das abgelehnte Passwort und startet einen neuen Login Flow.
+# Als Ablehnung zaehlt nur HTTP 401 mit OCS-Status 997: Ein 401/403 eines Proxys, 429 und Netzfehler sagen nichts ueber
+# das Passwort. Zeilen ohne Login-Name bleiben ungeprueft, die UID kann davon abweichen (upstream #980).
+# Upstream-Fassung: PR #1761, Branch pr/verify-stored-app-password in thekk1/nextcloud-mcp-server
+_APP_PASSWORD_CHECK_TIMEOUT = 5.0
 
 
-class _CheckedStorage:
-    def __init__(self, storage):
-        self._storage = storage
-
-    def __getattr__(self, name):
-        return getattr(self._storage, name)
-
-    async def get_app_password_with_scopes(self, user_id: str):
-        existing = await self._storage.get_app_password_with_scopes(user_id)
-        if not existing:
-            return existing
-        try:
-            async with nextcloud_httpx_client(
-                base_url=get_settings().nextcloud_host,
-                auth=httpx.BasicAuth(existing.get("username") or user_id, existing["app_password"]),
-                timeout=10.0,
-            ) as client:
-                status = (await client.get("/ocs/v2.php/cloud/user", headers=dict(OCS_REQUEST_HEADERS))).status_code
-        except Exception as e:
-            logger.warning("Could not validate the app password of %s: %s", user_id, e)
-            return existing
-        if status not in (401, 403):
-            return existing
-        logger.info("App password of %s rejected by Nextcloud (HTTP %s), removing", user_id, status)
-        await self._storage.delete_app_password(user_id)
-        invalidate_scope_cache(user_id)
+async def _rejected_app_password(user_id: str) -> bytes | None:
+    """Das verschluesselte gespeicherte Passwort, wenn Nextcloud es ablehnt, sonst None."""
+    storage = await auth_tools.get_shared_storage()
+    async with storage._db() as db:
+        async with db.execute(
+            "SELECT encrypted_password, username FROM app_passwords WHERE user_id = ?", (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+    if not row or not row[1]:
         return None
+    encrypted_password, username = row
+    try:
+        async with nextcloud_httpx_client(
+            base_url=get_settings().nextcloud_host,
+            auth=httpx.BasicAuth(username, storage.cipher.decrypt(encrypted_password).decode()),
+            timeout=_APP_PASSWORD_CHECK_TIMEOUT,
+        ) as client:
+            response = await client.get("/ocs/v2.php/cloud/user", headers=dict(OCS_REQUEST_HEADERS))
+        rejected = (response.status_code == 401
+                    and parse_ocs_envelope(response.json()).status_code == OCS_STATUS_UNAUTHENTICATED)
+    except Exception as e:
+        logger.warning("Could not validate the app password of %s: %s", user_id, e)
+        return None
+    if not response.is_success and not rejected:
+        logger.warning("App password check of %s inconclusive (HTTP %s)", user_id, response.status_code)
+    return encrypted_password if rejected else None
 
 
-async def _get_checked_storage():
-    return _CheckedStorage(await _get_shared_storage())
+async def _delete_app_password(user_id: str, encrypted_password: bytes) -> None:
+    """Loescht genau das gepruefte Passwort: Ein waehrend der Pruefung gespeichertes neues bleibt stehen."""
+    storage = await auth_tools.get_shared_storage()
+    async with storage._db() as db:
+        cursor = await db.execute(
+            "DELETE FROM app_passwords WHERE user_id = ? AND encrypted_password = ?", (user_id, encrypted_password)
+        )
+        await db.commit()
+        deleted = cursor.rowcount > 0
+    if deleted:
+        logger.info("App password of %s rejected by Nextcloud, removed", user_id)
+        invalidate_scope_cache(user_id)
 
 
-auth_tools.get_shared_storage = _get_checked_storage
+def _status_reports_revoked(tool):
+    @functools.wraps(tool)
+    async def wrapper(*args, **kwargs):
+        result = await tool(*args, **kwargs)
+        if result.status == "provisioned" and await _rejected_app_password(result.user_id):
+            return ProvisionStatusResponse(
+                status="revoked",
+                message=("Nextcloud no longer accepts the stored app password (revoked in Nextcloud). "
+                         "Call nc_auth_provision_access to log in again."),
+                user_id=result.user_id,
+                username=result.username,
+            )
+        return result
+    return wrapper
+
+
+def _provision_replaces_rejected(tool):
+    @functools.wraps(tool)
+    async def wrapper(*args, **kwargs):
+        result = await tool(*args, **kwargs)
+        if result.status == "already_provisioned":
+            encrypted_password = await _rejected_app_password(result.user_id)
+            if encrypted_password:
+                await _delete_app_password(result.user_id, encrypted_password)
+                result = await tool(*args, **kwargs)
+        return result
+    return wrapper
+
+
+_AUTH_TOOL_CHECKS = {"nc_auth_check_status": _status_reports_revoked,
+                     "nc_auth_provision_access": _provision_replaces_rejected}
+
+
+class _CheckedAuthTools:
+    """Steht bei register_auth_tools fuer den MCP-Server und legt die Pruefung um die fertig dekorierten Werkzeuge."""
+
+    def __init__(self, mcp):
+        self._mcp = mcp
+
+    def tool(self, *args, **kwargs):
+        register = self._mcp.tool(*args, **kwargs)
+        check = _AUTH_TOOL_CHECKS.get(kwargs.get("name"))
+        return (lambda tool: register(check(tool))) if check else register
+
+
+_register_auth_tools = auth_tools.register_auth_tools
+
+
+def register_auth_tools(mcp):
+    _register_auth_tools(_CheckedAuthTools(mcp))
+
+
+app.register_auth_tools = register_auth_tools
 
 from nextcloud_mcp_server.cli import cli  # noqa: E402  (nach dem Eintrag, die CLI liest AVAILABLE_APPS beim Import)
 
