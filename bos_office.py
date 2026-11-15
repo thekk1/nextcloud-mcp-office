@@ -27,6 +27,7 @@ import re
 import secrets
 import zipfile
 from typing import Any, Literal
+from xml.sax.saxutils import escape as xml_escape
 
 import anyio
 import httpx
@@ -35,6 +36,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from nextcloud_mcp_server.auth import require_scopes
+from nextcloud_mcp_server.client.webdav import WEBDAV_SEARCH_MAX_RESULTS
 from nextcloud_mcp_server.config import get_settings
 from nextcloud_mcp_server.context import get_client
 from nextcloud_mcp_server.links import with_links
@@ -82,6 +84,7 @@ def kind(path: str) -> str:
 
 CHECK_LIST_MAX_TERMS = 1000
 CHECK_LIST_MAX_HITS = 20
+CHECK_LIST_TERMS_PER_SEARCH = 50
 FULLTEXT_MAX_LIMIT = 50
 # LibreChat (tool-files) stores files from tool results up to this size
 CHAT_FILE_MAX_BYTES = 50 * 1024 * 1024
@@ -1645,16 +1648,44 @@ def configure_office_tools(mcp: MCPServer) -> None:
         client = await get_client(ctx)
         base = folder.strip("/")
         excluded = await get_excluded_file_paths(client.webdav)
-        items = [item for item in await client.webdav.search_files_all(scope=base)
-                 if item.get("path") and not is_path_excluded(item["path"], excluded)]
+
+        def wanted_of(term: str) -> str:
+            return term.strip("/").lower()
+
+        def name_of(term: str) -> str:
+            return wanted_of(term).rsplit("/", 1)[-1]
+
+        def by_path(term: str) -> bool:
+            return match == "path" or "/" in wanted_of(term)
+
+        # Nextcloud sucht die Namen in der Datenbank (iLike auf dem Namen), statt alle Dateien zu liefern: Die Wurzel
+        # hat mehr als 50000 Dateien, ein Vollscan dauert laenger als das Zeitlimit von LibreChat (60 s).
+        # Gefunden wird grob, der genaue Vergleich folgt unten.
+        def condition(term: str) -> str:
+            value = name_of(term).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            if not (by_path(term) or match == "name_exact"):
+                value = f"%{value}%"
+            return f"<d:like><d:prop><d:displayname/></d:prop><d:literal>{xml_escape(value)}</d:literal></d:like>"
+
+        conditions = sorted({condition(term) for term in terms if name_of(term)})
+        items: dict[Any, dict[str, Any]] = {}
+        truncated = False
+        for i in range(0, len(conditions), CHECK_LIST_TERMS_PER_SEARCH):
+            chunk = conditions[i:i + CHECK_LIST_TERMS_PER_SEARCH]
+            where = chunk[0] if len(chunk) == 1 else f"<d:or>{''.join(chunk)}</d:or>"
+            rows = await client.webdav.search_files_all(scope=base, where_conditions=where)
+            truncated = truncated or len(rows) >= WEBDAV_SEARCH_MAX_RESULTS
+            for item in rows:
+                if item.get("path") and not is_path_excluded(item["path"], excluded):
+                    items[item.get("file_id") or item["path"]] = item
         found: dict[str, list[dict[str, Any]]] = {}
         for term in terms:
-            wanted = term.strip("/").lower()
-            for item in items:
+            wanted = wanted_of(term)
+            for item in items.values():
                 path = item["path"].strip("/")
                 name = path.rsplit("/", 1)[-1]
                 relative = path[len(base) + 1:] if base and path.lower().startswith(base.lower() + "/") else path
-                if match == "path" or "/" in wanted:
+                if by_path(term):
                     hit = wanted in (path.lower(), relative.lower())
                 elif match == "name_exact":
                     hit = name.lower() == wanted
@@ -1664,8 +1695,11 @@ def configure_office_tools(mcp: MCPServer) -> None:
                     found[term].append({"path": path, "size": item.get("size"),
                                         "modified": item.get("last_modified")})
         missing = [term for term in terms if term not in found]
-        result: dict[str, Any] = {"files_scanned": len(items), "values_checked": len(terms),
-                                  "found_count": len(found), "missing_count": len(missing), "missing": missing}
+        result: dict[str, Any] = {"values_checked": len(terms), "found_count": len(found),
+                                  "missing_count": len(missing), "missing": missing}
+        if truncated:
+            result["truncated"] = (f"a search returned {WEBDAV_SEARCH_MAX_RESULTS} files, the limit: missing values "
+                                   "may exist; check fewer or more specific values")
         if not only_missing:
             result["found"] = found
         return result
