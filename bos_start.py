@@ -28,6 +28,7 @@ from nextcloud_mcp_server.auth import grant_ownership, provision_routes
 from nextcloud_mcp_server.auth.scope_authorization import invalidate_scope_cache
 from nextcloud_mcp_server.auth.storage import OCS_REQUEST_HEADERS, nextcloud_httpx_client
 from nextcloud_mcp_server.client.ocs import OCS_STATUS_UNAUTHENTICATED, parse_ocs_envelope
+from nextcloud_mcp_server.client import webdav as webdav_client
 from nextcloud_mcp_server.client.webdav import WebDAVClient
 from nextcloud_mcp_server.config import get_document_processor_config, get_settings
 from nextcloud_mcp_server.models.auth import ProvisionStatusResponse
@@ -71,6 +72,50 @@ def _build_search_xml_with_order_prop(self, *args, **kwargs):
 
 
 WebDAVClient._build_search_xml = _build_search_xml_with_order_prop
+
+# Vollstaendige WebDAV-Suche: upstream blaettert search_files_all ohne Sortierung und haelt eine Seite mit weniger
+# als page_size Eintraegen fuer die letzte. Nextcloud entfernt aber den durchsuchten Ordner selbst erst nach LIMIT
+# aus der Seite (Folder::search), eine volle Seite hat dann 999 von 1000 Eintraegen, und die Suche endet mitten im
+# Ordner. Ohne ORDER BY ist die Reihenfolge von LIMIT/OFFSET ausserdem nicht festgelegt, Seiten ueberlappen oder
+# lassen Eintraege aus. Deshalb sortiert die Suche hier nach Aenderungszeit, Name und Groesse (fileid ist in
+# Nextcloud nicht sortierbar) und endet erst an einer leeren Seite.
+_SEARCH_ALL_ORDER = [("getlastmodified", "ascending"), ("displayname", "ascending"), ("size", "ascending")]
+
+
+def _search_key(item):
+    file_id = item.get("file_id")
+    return file_id if file_id is not None else item.get("path") or id(item)
+
+
+async def _search_files_all_complete(self, scope="", where_conditions=None, properties=None, order_by=None,
+                                     page_size=webdav_client.WEBDAV_SEARCH_PAGE_SIZE,
+                                     max_results=webdav_client.WEBDAV_SEARCH_MAX_RESULTS):
+    order_by = order_by or _SEARCH_ALL_ORDER
+    results, seen, offset = [], set(), 0
+    while len(results) < max_results:
+        try:
+            page = await self.search_files(scope=scope, where_conditions=where_conditions, properties=properties,
+                                           order_by=order_by, limit=page_size, offset=offset)
+        except Exception:
+            if offset == 0:
+                raise
+            logger.warning("WebDAV SEARCH offset page failed for scope %r; falling back to single fetch", scope)
+            return await self._single_fetch_fallback(scope, where_conditions, properties, order_by, max_results)
+        if not page:
+            break
+        fresh = [item for item in page if _search_key(item) not in seen]
+        if offset > 0 and not fresh:
+            logger.warning("WebDAV SEARCH ignored offset for scope %r; falling back to single fetch", scope)
+            return await self._single_fetch_fallback(scope, where_conditions, properties, order_by, max_results)
+        for item in fresh:
+            seen.add(_search_key(item))
+            results.append(item)
+        offset += page_size
+    self._warn_if_truncated(len(results), scope, max_results)
+    return results[:max_results]
+
+
+WebDAVClient.search_files_all = _search_files_all_complete
 
 # Ordnergroessen: upstream liefert bei Ordnern size=None, die Groesse eines Ordners liesse sich nur durch Aufsummieren
 # aller Dateien ermitteln. Nextcloud kennt sie: oc:size ist die rekursive Groesse aus dem Datei-Cache, negative Werte

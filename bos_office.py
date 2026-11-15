@@ -1631,7 +1631,7 @@ def configure_office_tools(mcp: MCPServer) -> None:
         ``values``: file names, name parts or paths, separated by commas or new lines (a JSON array is accepted
         too), at most 1000. ``match``: "name" (default) finds each value as a whole word in a file or folder
         name ("Plan 12" does not match "Plan 123"), "name_exact" compares the whole name, "path" compares the
-        path relative to ``folder`` or to the root.
+        path relative to ``folder`` or to the root. A value with a "/" is always compared as a path.
         Returns which values have matches (path, size, modified; at most 20 per value) and which are missing.
         Use this instead of one search or directory listing per value.
         """
@@ -1654,7 +1654,7 @@ def configure_office_tools(mcp: MCPServer) -> None:
                 path = item["path"].strip("/")
                 name = path.rsplit("/", 1)[-1]
                 relative = path[len(base) + 1:] if base and path.lower().startswith(base.lower() + "/") else path
-                if match == "path":
+                if match == "path" or "/" in wanted:
                     hit = wanted in (path.lower(), relative.lower())
                 elif match == "name_exact":
                     hit = name.lower() == wanted
