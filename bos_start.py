@@ -22,15 +22,15 @@ import sys
 import xml.etree.ElementTree as ET
 from urllib.parse import unquote
 
-import httpx
+import httpx2 as httpx
 
 from nextcloud_mcp_server import app, server
 from nextcloud_mcp_server.auth import grant_ownership, provision_routes
 from nextcloud_mcp_server.auth.scope_authorization import invalidate_scope_cache
-from nextcloud_mcp_server.auth.storage import OCS_REQUEST_HEADERS, nextcloud_httpx_client
-from nextcloud_mcp_server.client.ocs import OCS_STATUS_UNAUTHENTICATED, parse_ocs_envelope
-from nextcloud_mcp_server.client import webdav as webdav_client
-from nextcloud_mcp_server.client.webdav import WebDAVClient
+from nextcloud_mcp_server.http import nextcloud_httpx_client
+from nextcloud_client.ocs import OCS_REQUEST_HEADERS, OCS_STATUS_UNAUTHENTICATED, parse_ocs_envelope
+from nextcloud_client import webdav as webdav_client
+from nextcloud_client.webdav import WebDAVClient
 from nextcloud_mcp_server.config import get_document_processor_config, get_settings
 from nextcloud_mcp_server.models.auth import ProvisionStatusResponse
 from nextcloud_mcp_server.server import auth_tools

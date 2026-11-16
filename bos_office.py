@@ -30,13 +30,13 @@ from typing import Any, Literal
 from xml.sax.saxutils import escape as xml_escape
 
 import anyio
-import httpx
+import httpx2 as httpx
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from nextcloud_mcp_server.auth import require_scopes
-from nextcloud_mcp_server.client.webdav import WEBDAV_SEARCH_MAX_RESULTS
+from nextcloud_client.webdav import WEBDAV_SEARCH_MAX_RESULTS
 from nextcloud_mcp_server.config import get_settings
 from nextcloud_mcp_server.context import get_client
 from nextcloud_mcp_server.links import with_links
