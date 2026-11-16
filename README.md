@@ -1,6 +1,6 @@
 # nextcloud-mcp-office
 
-[nextcloud-mcp-server](https://github.com/cbcoutinho/nextcloud-mcp-server) 0.202.1 with additional tools:
+[nextcloud-mcp-server](https://github.com/cbcoutinho/nextcloud-mcp-server) 0.212.0 with additional tools:
 
 - `bos_office.py`: Office tools (create, edit and convert documents, spreadsheets, presentations and PDF in
   Nextcloud), copying chat files into Nextcloud (`nc_office_save_chat_file`), `nc_files_check_list`, and

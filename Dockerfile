@@ -1,5 +1,5 @@
 # nextcloud-mcp mit Office-Werkzeugen (bos_office.py): Dokumente, Tabellen, Praesentationen und PDF in der
-# Nextcloud anlegen, bearbeiten und umwandeln. Basis fest auf nextcloud-mcp-server 0.202.1; sie bringt
+# Nextcloud anlegen, bearbeiten und umwandeln. Basis fest auf nextcloud-mcp-server 0.212.0; sie bringt
 # python-docx, openpyxl und python-pptx mit, es fehlt nur pypdf.
 FROM ghcr.io/cbcoutinho/nextcloud-mcp-server@sha256:8fbf449a68e92b416e475804dd4adaf4f9c43a5b3d83e8dc0da0b112b359700e
 USER root
