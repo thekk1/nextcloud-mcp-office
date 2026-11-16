@@ -1253,6 +1253,14 @@ def chat_files(user_id: str) -> list[dict[str, Any]]:
 # "requested order by property is not a valid property for this scope").
 _ORDER_PROPS = {"size": "{http://owncloud.org/ns}size", "modified": "getlastmodified", "name": "displayname"}
 
+# Nextcloud nimmt fuer den MIME-Typ nur "typ/untertyp" oder "typ/%" an und lehnt alles andere mit HTTP 500 ab,
+# das wie ein voruebergehender Fehler aussieht. "%" allein und aehnliche Schreibweisen meinen alle Dateien:
+# Dafuer sucht das Werkzeug alles ausser Ordnern, statt dass das Modell jeden Typ einzeln abfragt.
+_ALL_TYPES = {"", "%", "*", "*/*", "*/%", "%/%"}
+_MIME_FORMAT = re.compile(r"[\w.+-]+/(%|[\w.+-]+)")
+_NO_FOLDERS = ("<d:not><d:eq><d:prop><d:getcontenttype/></d:prop>"
+               "<d:literal>httpd/unix-directory</d:literal></d:eq></d:not>")
+
 
 def configure_office_tools(mcp: MCPServer) -> None:
     # Ersetzt das gleichnamige Werkzeug aus nextcloud_mcp_server.server.webdav (die App "office" wird zuletzt
@@ -1270,12 +1278,13 @@ def configure_office_tools(mcp: MCPServer) -> None:
         """Find files by MIME type in NextCloud, searching all subfolders of scope.
 
         Args:
-            mime_type: MIME type to search for (supports % wildcard)
+            mime_type: "type/subtype" (application/pdf), "type/%" (image/%), "httpd/unix-directory" for
+                folders, or "%" for files of every type (without folders)
             scope: Directory path to search in (empty string for user root)
             limit: Maximum number of results to return
             order_by: Sort on the server before limit applies: "size", "modified" or "name".
-                For "the N largest / newest files of a type" call once with order_by and limit=N;
-                do not collect files folder by folder.
+                For "the N largest / newest files" call once with order_by and limit=N, with "%" for
+                every type; do not call once per type and do not collect files folder by folder.
             descending: Direction for order_by; true (default) puts the largest / newest first
 
         Returns:
@@ -1285,7 +1294,13 @@ def configure_office_tools(mcp: MCPServer) -> None:
         excluded = await get_excluded_file_paths(client.webdav)
         if scope and is_path_excluded(scope, excluded):
             raise ToolError(f"Access denied: scope {scope!r} is tagged with an excluded tag")
-        where_conditions, properties = client.webdav._type_search_args(mime_type)
+        mime = mime_type.strip()
+        if mime not in _ALL_TYPES and not _MIME_FORMAT.fullmatch(mime):
+            raise ToolError(f'mime_type {mime_type!r} is not supported: use "type/subtype" (application/pdf), '
+                            '"type/%" (image/%) or "%" for files of every type')
+        where_conditions, properties = client.webdav._type_search_args(mime)
+        if mime in _ALL_TYPES:
+            where_conditions = _NO_FOLDERS
         results = await client.webdav.search_files(
             scope=scope, where_conditions=where_conditions, properties=properties,
             order_by=[(_ORDER_PROPS[order_by], "descending" if descending else "ascending")] if order_by else None,
