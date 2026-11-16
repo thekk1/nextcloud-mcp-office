@@ -15,6 +15,7 @@ mit dem der Zugriff gewaehrt wurde, ist der preferred_username des Aufrufers aus
 App-Passwort meldet sich an Nextcloud an.
 """
 import functools
+import inspect
 import logging
 import re
 import sys
@@ -188,6 +189,41 @@ def _total_size_includes_folders(tool):
     return wrapper
 
 
+_READ_PART = 40_000
+
+
+def _read_in_parts(tool):
+    """Gibt den Text einer Datei in Teilen von hoechstens _READ_PART Zeichen zurueck (text_offset waehlt den Teil).
+
+    Eine grosse Tabelle oder ein langes Dokument als Ganzes sprengt das Kontextfenster des lesenden Agenten.
+    """
+    async def wrapper(*args, text_offset: int = 0, **kwargs):
+        result = await tool(*args, **kwargs)
+        if result.content_format == "base64":
+            return result
+        total = len(result.content)
+        start = min(max(text_offset, 0), total)
+        end = min(total, start + _READ_PART)
+        if start or end < total:
+            result.content = result.content[start:end]
+            more = f" Call again with text_offset={end} for the next part." if end < total else ""
+            result.parse_notes.append(f"This is characters {start} to {end} of {total} of the text.{more}")
+        return result
+    functools.update_wrapper(wrapper, tool)
+    del wrapper.__wrapped__
+    signature = inspect.signature(tool)
+    offset = inspect.Parameter("text_offset", inspect.Parameter.KEYWORD_ONLY, default=0, annotation=int)
+    wrapper.__signature__ = signature.replace(parameters=[*signature.parameters.values(), offset])
+    wrapper.__annotations__ = {**tool.__annotations__, "text_offset": int}
+    wrapper.__doc__ = re.sub(
+        r"^( *)Returns:$",
+        lambda m: f"{m[1]}    text_offset: The text comes in parts of at most {_READ_PART} characters; parse_notes\n"
+                  f"{m[1]}        names the range and the text_offset of the next part. Default 0, the first part.\n\n"
+                  f"{m[1]}Returns:",
+        tool.__doc__, count=1, flags=re.M)
+    return wrapper
+
+
 class _WrappedTools:
     """Steht bei der Registrierung fuer den MCP-Server und legt Ergaenzungen um die fertig dekorierten Werkzeuge."""
 
@@ -209,7 +245,8 @@ class _WrappedTools:
 
 _configure_webdav_tools = server.AVAILABLE_APPS["webdav"]
 server.AVAILABLE_APPS["webdav"] = lambda mcp: _configure_webdav_tools(
-    _WrappedTools(mcp, {"nc_webdav_list_directory": _total_size_includes_folders}))
+    _WrappedTools(mcp, {"nc_webdav_list_directory": _total_size_includes_folders,
+                        "nc_webdav_read_file": _read_in_parts}))
 
 _caller_identities = grant_ownership.caller_identities
 _grant_belongs_to_caller = grant_ownership.grant_belongs_to_caller
@@ -339,6 +376,9 @@ def register_auth_tools(mcp):
 
 app.register_auth_tools = register_auth_tools
 
-from nextcloud_mcp_server.cli import cli  # noqa: E402  (nach dem Eintrag, die CLI liest AVAILABLE_APPS beim Import)
+# Die PDF-Worker von anyio.to_process fuehren dieses Skript als __mp_main__ aus; ohne die Abfrage startet
+# dort die CLI, beendet den Worker beim Start, und jede isolierte PDF-Auswertung scheitert mit reason=oom.
+if __name__ == "__main__":
+    from nextcloud_mcp_server.cli import cli  # noqa: E402  (nach dem Eintrag, die CLI liest AVAILABLE_APPS beim Import)
 
-sys.exit(cli())
+    sys.exit(cli())
