@@ -1269,6 +1269,20 @@ def _activity_bound(value: str, zone: zoneinfo.ZoneInfo, end: bool) -> datetime.
     return moment if moment.tzinfo else moment.replace(tzinfo=zone)
 
 
+async def _own_user_id(client) -> str:
+    """Nextcloud-Benutzer-ID des Kontos; der Filter actor vergleicht mit ihr, nicht mit dem Anmeldenamen.
+
+    Mit dem Anmeldenamen ("jdoe" statt der ID "jdoe@example.com") liefert der Aktivitaetsstrom 304, also nichts.
+    """
+    try:
+        response = await client.webdav._make_request(
+            "GET", "/ocs/v2.php/cloud/user", params={"format": "json"}, headers={"Accept": "application/json"})
+        user_id = ((response.json().get("ocs") or {}).get("data") or {}).get("id")
+    except (httpx.HTTPError, ValueError, AttributeError):
+        user_id = None
+    return user_id if isinstance(user_id, str) and user_id else client.username
+
+
 def _activity_entry(item: dict[str, Any], excluded) -> dict[str, Any] | None:
     """Ein Eintrag der Aktivitaeten-API ohne Vorschauen, Symbole und Rich-Text; None fuer gesperrte Pfade."""
     paths = [p.strip("/") for p in (item.get("objects") or {}).values() if isinstance(p, str) and p]
@@ -1852,7 +1866,7 @@ def configure_office_tools(mcp: MCPServer) -> None:
         if end < start:
             raise ToolError("date_to lies before date_from")
         client = await get_client(ctx)
-        name = actor_name.strip() or (client.username if actor == "me" else "")
+        name = actor_name.strip() or (await _own_user_id(client) if actor == "me" else "")
         stream = "by" if actor == "others" and not actor_name.strip() else "all"
         params: dict[str, Any] = {"format": "json", "sort": "asc", "limit": ACTIVITY_PAGE,
                                   "from": int(start.timestamp()), "to": int(end.timestamp())}
