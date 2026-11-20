@@ -26,6 +26,7 @@ import pathlib
 import re
 import secrets
 import zipfile
+import zoneinfo
 from typing import Any, Literal
 from xml.sax.saxutils import escape as xml_escape
 
@@ -1246,6 +1247,46 @@ def chat_files(user_id: str) -> list[dict[str, Any]]:
     return sorted(found, key=lambda f: f["mtime"], reverse=True)
 
 
+# --- Aktivitaeten ---------------------------------------------------------------------------------------------
+# Die App activity begrenzt eine Seite auf 200 Eintraege (Data::get). 25 Seiten sind 5000 Eintraege; mehr hat ein
+# Zeitraum, den ein Modell sinnvoll liest, nicht.
+ACTIVITY_PAGE = 200
+ACTIVITY_MAX_PAGES = 25
+ACTIVITY_TEXT = 300
+
+
+def _activity_bound(value: str, zone: zoneinfo.ZoneInfo, end: bool) -> datetime.datetime:
+    """Tag (YYYY-MM-DD) oder Zeitpunkt (ISO) als Grenze; ein Tag zaehlt als Ganzes."""
+    value = value.strip()
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            day = datetime.date.fromisoformat(value)
+            moment = datetime.datetime.combine(day, datetime.time.max if end else datetime.time.min, zone)
+            return moment.replace(microsecond=0)
+        moment = datetime.datetime.fromisoformat(value)
+    except ValueError as e:
+        raise ToolError(f"{value!r} is neither YYYY-MM-DD nor an ISO date-time") from e
+    return moment if moment.tzinfo else moment.replace(tzinfo=zone)
+
+
+def _activity_entry(item: dict[str, Any], excluded) -> dict[str, Any] | None:
+    """Ein Eintrag der Aktivitaeten-API ohne Vorschauen, Symbole und Rich-Text; None fuer gesperrte Pfade."""
+    paths = [p.strip("/") for p in (item.get("objects") or {}).values() if isinstance(p, str) and p]
+    if not paths and item.get("object_type") == "files" and item.get("object_name"):
+        paths = [str(item["object_name"]).strip("/")]
+    if excluded and any(is_path_excluded(p, excluded) for p in paths):
+        return None
+    entry: dict[str, Any] = {"time": item.get("datetime"), "user": item.get("user"), "type": item.get("type"),
+                             "app": item.get("app"), "subject": (item.get("subject") or "")[:ACTIVITY_TEXT]}
+    if paths:
+        entry["paths"] = paths
+    if item.get("message"):
+        entry["message"] = item["message"][:ACTIVITY_TEXT]
+    if item.get("link"):
+        entry["link"] = item["link"]
+    return entry
+
+
 # --- Werkzeuge --------------------------------------------------------------------------------------------------
 
 # Sortierschluessel von nc_webdav_find_by_type und die WebDAV-Eigenschaft, nach der Nextcloud sortiert.
@@ -1783,3 +1824,73 @@ def configure_office_tools(mcp: MCPServer) -> None:
                             "excerpts": excerpts[:FULLTEXT_EXCERPTS]})
         return {"query": query, "total": total, "page": page, "limit": limit, "has_more": page * limit < total,
                 "results": results}
+
+    @mcp.tool(title="List Activities", annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+    @require_scopes("files.read")
+    @instrument_tool
+    async def nc_activity_list(date_from: str, ctx: Context, date_to: str = "",
+                               actor: Literal["me", "others", "all"] = "me", actor_name: str = "",
+                               path_contains: str = "", time_zone: str = "Europe/Berlin"):
+        """List who did what in Nextcloud in a period, from the user's activity stream: files and folders
+        created, changed, renamed, moved, deleted, restored, shared, tagged and commented, and events of other
+        apps. Each entry names the account that did it (``user``), so this is the tool for "what did I do on
+        <day>" and "who changed this file". A file's modification time does not say who changed it; this does.
+
+        ``date_from``/``date_to``: days as YYYY-MM-DD (or ISO date-times), both inclusive, in ``time_zone``;
+        ``date_to`` empty means the day of ``date_from``. ``actor``: "me" (only what the user did), "others"
+        (what other accounts did to files the user can see) or "all". ``actor_name``: only this account
+        (e.g. "jdoe@example.com"); it overrides ``actor``. ``path_contains``: only entries whose file path
+        contains this text. Reads every page of the period, oldest first; ``complete`` is false when the period
+        holds more entries than the tool returns.
+        """
+        try:
+            zone = zoneinfo.ZoneInfo(time_zone)
+        except (zoneinfo.ZoneInfoNotFoundError, ValueError) as e:
+            raise ToolError(f"unknown time_zone {time_zone!r}") from e
+        start = _activity_bound(date_from, zone, end=False)
+        end = _activity_bound(date_to or date_from, zone, end=True)
+        if end < start:
+            raise ToolError("date_to lies before date_from")
+        client = await get_client(ctx)
+        name = actor_name.strip() or (client.username if actor == "me" else "")
+        stream = "by" if actor == "others" and not actor_name.strip() else "all"
+        params: dict[str, Any] = {"format": "json", "sort": "asc", "limit": ACTIVITY_PAGE,
+                                  "from": int(start.timestamp()), "to": int(end.timestamp())}
+        if name:
+            params["actor"] = name
+        if path_contains.strip():
+            params["search"] = path_contains.strip()
+        excluded = await get_excluded_file_paths(client.webdav)
+        entries: list[dict[str, Any]] = []
+        complete = True
+        since = 0
+        for _ in range(ACTIVITY_MAX_PAGES):
+            try:
+                response = await client.webdav._make_request(
+                    "GET", f"/ocs/v2.php/apps/activity/api/v2/activity/{stream}",
+                    params={**params, "since": since}, headers={"Accept": "application/json"})
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 304:  # nichts (mehr) im Zeitraum
+                    break
+                raise ToolError(f"activity request failed (HTTP {e.response.status_code}): "
+                                f"{e.response.text[:300]}") from e
+            if response.status_code == 204:
+                raise ToolError("the activity stream is switched off for this user")
+            if response.status_code == 304 or not response.content:
+                break
+            batch = (response.json().get("ocs") or {}).get("data") or []
+            for item in batch:
+                entry = _activity_entry(item, excluded)
+                if entry:
+                    entries.append(entry)
+            last = response.headers.get("X-Activity-Last-Given")
+            if not batch or not last or 'rel="next"' not in response.headers.get("Link", ""):
+                break
+            since = int(last)
+        else:
+            complete = False
+        counts: dict[str, int] = {}
+        for entry in entries:
+            counts[entry["type"]] = counts.get(entry["type"], 0) + 1
+        return {"from": start.isoformat(), "to": end.isoformat(), "actor": name or actor, "total": len(entries),
+                "complete": complete, "by_type": counts, "activities": entries}
