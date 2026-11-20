@@ -1283,20 +1283,34 @@ async def _own_user_id(client) -> str:
     return user_id if isinstance(user_id, str) and user_id else client.username
 
 
-def _activity_entry(item: dict[str, Any], excluded) -> dict[str, Any] | None:
-    """Ein Eintrag der Aktivitaeten-API ohne Vorschauen, Symbole und Rich-Text; None fuer gesperrte Pfade."""
-    paths = [p.strip("/") for p in (item.get("objects") or {}).values() if isinstance(p, str) and p]
-    if not paths and item.get("object_type") == "files" and item.get("object_name"):
-        paths = [str(item["object_name"]).strip("/")]
+def _activity_entry(item: dict[str, Any], excluded, zone=None) -> dict[str, Any] | None:
+    """Ein Eintrag der Aktivitaeten-API ohne Vorschauen, Symbole und Rich-Text; None fuer gesperrte Pfade.
+
+    ``files`` nennt jede Datei mit ihrer ID aus ``objects``, damit jede ihren eigenen Link bekommt: ``link`` der
+    API zeigt bei Dateien auf den Ordner, und mit ihm verlinkte der Subagent jede Datei eines Eintrags auf
+    denselben Ordner. ``time`` steht in ``zone``; die API liefert UTC, und die Umrechnung blieb dem Modell.
+    """
+    objects = [(str(file_id), path.strip("/")) for file_id, path in (item.get("objects") or {}).items()
+               if isinstance(path, str) and path]
+    if not objects and item.get("object_type") == "files" and item.get("object_name"):
+        objects = [(str(item.get("object_id") or ""), str(item["object_name"]).strip("/"))]
+    paths = [path for _, path in objects]
     if excluded and any(is_path_excluded(p, excluded) for p in paths):
         return None
-    entry: dict[str, Any] = {"time": item.get("datetime"), "user": item.get("user"), "type": item.get("type"),
+    when = item.get("datetime")
+    if zone is not None and isinstance(when, str):
+        try:
+            when = datetime.datetime.fromisoformat(when).astimezone(zone).isoformat()
+        except ValueError:
+            pass
+    entry: dict[str, Any] = {"time": when, "user": item.get("user"), "type": item.get("type"),
                              "app": item.get("app"), "subject": (item.get("subject") or "")[:ACTIVITY_TEXT]}
-    if paths:
-        entry["paths"] = paths
+    if objects:
+        entry["files"] = [{"path": path, **({"file_id": file_id} if file_id.isdigit() and file_id != "0" else {})}
+                          for file_id, path in objects]
     if item.get("message"):
         entry["message"] = item["message"][:ACTIVITY_TEXT]
-    if item.get("link"):
+    if item.get("link") and not objects:
         entry["link"] = item["link"]
     return entry
 
@@ -1855,7 +1869,9 @@ def configure_office_tools(mcp: MCPServer) -> None:
         (what other accounts did to files the user can see) or "all". ``actor_name``: only this account
         (e.g. "jdoe@example.com"); it overrides ``actor``. ``path_contains``: only entries whose file path
         contains this text. Reads every page of the period, oldest first; ``complete`` is false when the period
-        holds more entries than the tool returns.
+        holds more entries than the tool returns. ``time`` is in ``time_zone``. ``files`` names each file of an
+        entry with its path and ``file_id``; its link is https://<host>/index.php/f/<file_id>. ``link`` is
+        given only for entries without files.
         """
         try:
             zone = zoneinfo.ZoneInfo(time_zone)
@@ -1894,7 +1910,7 @@ def configure_office_tools(mcp: MCPServer) -> None:
                 break
             batch = (response.json().get("ocs") or {}).get("data") or []
             for item in batch:
-                entry = _activity_entry(item, excluded)
+                entry = _activity_entry(item, excluded, zone)
                 if entry:
                     entries.append(entry)
             last = response.headers.get("X-Activity-Last-Given")
